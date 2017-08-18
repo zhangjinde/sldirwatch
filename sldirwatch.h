@@ -9,6 +9,24 @@
 extern "C" {
 #endif
 
+#ifndef SLDIRWATCH_ASSERT
+	#include <assert.h>
+	#define SLDIRWATCH_ASSERT(x) assert(x)
+#endif
+
+/* build sldirwatch as static functions */
+#ifdef SLDIRWATCH_STATIC
+	#ifdef __GNUC__
+		#define SLDIRWATCH_UNUSED_FUNC __attribute__ ((unused))
+	#else
+		#define SLDIRWATCH_UNUSED_FUNC
+	#endif
+
+	#define SLDIRWATCH_FUNC static SLDIRWATCH_UNUSED_FUNC
+#else
+	#define SLDIRWATCH_FUNC
+#endif
+
 /* maximum size of file and directory pathes, in utf8 */
 #define SLDIRWATCH_PATH_SIZE 256
 
@@ -23,10 +41,11 @@ extern "C" {
  * occurs.
  *  \param filename name of file that triggered an event (file that was
  *    modified)
- *  \param data constant stored in watchpoint. Could be used to determine
+ *  \param ud_ptr constant stored in watchpoint. Could be used to determine
  *    which watchpoint triggered a callback
+ *  \param ud_int constant stored in watchpoint.
  */
-typedef void (sldirwatch_callback_f)(const char *filename, int data);
+typedef void (sldirwatch_callback_f)(const char *filename, void *ud_ptr, int ud_int);
 
 enum sldirwatch_flags_e {
 	SLDIRWATCH_MERGE_PATHS_BIT = 1,
@@ -40,17 +59,25 @@ enum sldirwatch_flags_e {
 typedef struct {
 	char path[SLDIRWATCH_PATH_SIZE];
 	int wd;
-	int data;
+	void *ud_ptr;
+	int ud_int;
 	unsigned int flags;
 	sldirwatch_callback_f *cb;
 #ifdef _WIN32
-#define SLDIRWATCH_WATCHBUFFER_SIZE 1024
 	HANDLE dir;
 	OVERLAPPED ovp;
-	char lpBuffer[SLDIRWATCH_WATCHBUFFER_SIZE];
+	char lpBuffer[1024];
 	DWORD returnedBytes;
 #endif
 } sldirwatch_watchpoint_t;
+
+typedef struct {
+	int watchpoint_id;
+	/* watchpoint directory + relative filename (fopen()'able)*/
+	char filename[SLDIRWATCH_PATH_SIZE];
+	/* filename relative to watchpoint directory */
+	char relative_filename[SLDIRWATCH_PATH_SIZE];
+} sldirwatch_event_t;
 
 typedef struct {
 	int locked;
@@ -65,6 +92,10 @@ typedef struct {
 #endif
 
 	sldirwatch_watchpoint_t *watchpoints;
+
+	/* max amount of queued events is tied to buffer sizes; don't reduce */
+	int num_queued_events;
+	sldirwatch_event_t queued_events[32];
 } sldirwatch_t;
 
 /* how much memory context needs */
@@ -72,26 +103,35 @@ typedef struct {
 
 /** Init context for given max_watchpoints. ctx memory size must be enough
  * (at least SLDIRWATCH_SIZE(max_watchpoints)).
- * \return 0 on success */
-int sldirwatch_init(sldirwatch_t *ctx, int max_watchpoints);
+ * \return 1 on success */
+SLDIRWATCH_FUNC int sldirwatch_init(sldirwatch_t *ctx, int max_watchpoints);
 /** Deinit context. */
-void sldirwatch_deinit(sldirwatch_t *ctx);
+SLDIRWATCH_FUNC void sldirwatch_deinit(sldirwatch_t *ctx);
 
-/** Add a watchpoint
+/** Add a watchpoint with callback
  *  \param ctx context to add watchpoint into
  *  \param path path to directory to watch
  *  \param callback callback to fire when file notification event occurs
- *  \param data watchpoint-specific constant to pass into a callback
+ *  \param ud_ptr watchpoint-specific constant to be passed into a callback
+ *  \param ud_int watchpoint-specific constant to be passed into a callback
  *  \param flags bitfield of flags (see \c sldirwatch_flags_e)
- *  \return 0 on success
+ *  \return watchpoint id
  */
-int sldirwatch_add_watchpoint(sldirwatch_t *ctx, const char *path, sldirwatch_callback_f *callback, int data, unsigned int flags);
+SLDIRWATCH_FUNC int sldirwatch_add_watchpoint(sldirwatch_t *ctx, const char *path, unsigned int flags);
 
-/** Poll every watchpoint for new events, and fire callbacks when events occur.
- *  \param ctx working context
- *  \return total number of processed events, or -1 on error
+/** Set callback to be called each time file modification is detected in
+ * specified watchpoint */
+SLDIRWATCH_FUNC void sldirwatch_set_callback(sldirwatch_t *ctx, int watchpoint_id, sldirwatch_callback_f *callback, void *ud_ptr, int ud_int);
+
+/** Poll watchpoints and write one event into \c ev. If watchpoint have a
+ * callback - it will be called.
+ * \return 1 if there was an event
  */
-int sldirwatch_poll_watchpoints(sldirwatch_t *ctx);
+SLDIRWATCH_FUNC int sldirwatch_poll(sldirwatch_t *ctx, sldirwatch_event_t *ev);
+
+#ifdef SLDIRWATCH_STATIC
+	#include "sldirwatch.c"
+#endif
 
 #ifdef __cplusplus
 }

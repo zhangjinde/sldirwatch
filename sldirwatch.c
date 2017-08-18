@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 /* inotify's event buffer size */
-#define EVENT_BUF_SIZE (8 * (sizeof(struct inotify_event) + 16))
+#define SLDIRWATCH_EVENT_BUF_SIZE (8 * (sizeof(struct inotify_event) + 16))
 
 #elif defined(_WIN32)
 #include <windows.h>
@@ -27,7 +27,7 @@
  * inotify
  * returns watchpoint's index
  */
-static int search_wd(const sldirwatch_t *ctx, int wd) {
+static int _sldirwatch_search_wd(const sldirwatch_t *ctx, int wd) {
 	int i;
 	for(i = 0; i != ctx->num_watchpoints; ++i) {
 		if(ctx->watchpoints[i].wd == wd) {
@@ -40,7 +40,7 @@ static int search_wd(const sldirwatch_t *ctx, int wd) {
 #endif
 
 /* = snprintf(out, out_size, "%s/%s", p0, p1) */
-static void join_paths(char *out, int out_size, const char *p0, const char *p1) {
+static void _sldirwatch_join_paths(char *out, int out_size, const char *p0, const char *p1) {
 	while(*p0) {
 		if(out_size > 1) {
 			*out++ = *p0++;
@@ -68,7 +68,7 @@ static void join_paths(char *out, int out_size, const char *p0, const char *p1) 
 }
 
 #ifdef _WIN32
-static void join_paths_wchar(wchar_t *out, int out_cnt, const wchar_t *p0, const wchar_t *p1) {
+static void _sldirwatch_join_paths_wchar(wchar_t *out, int out_cnt, const wchar_t *p0, const wchar_t *p1) {
 	while(*p0) {
 		if(out_cnt > 1) {
 			*out++ = *p0++;
@@ -97,7 +97,7 @@ static void join_paths_wchar(wchar_t *out, int out_cnt, const wchar_t *p0, const
 #endif
 
 
-int sldirwatch_init(sldirwatch_t *ctx, int max_watchpoints) {
+SLDIRWATCH_FUNC int sldirwatch_init(sldirwatch_t *ctx, int max_watchpoints) {
 	memset(ctx, 0, SLDIRWATCH_SIZE(max_watchpoints));
 
 	ctx->max_watchpoints = max_watchpoints;
@@ -111,10 +111,10 @@ int sldirwatch_init(sldirwatch_t *ctx, int max_watchpoints) {
 	ctx->fd = 1;
 #endif
 
-	return !(ctx->fd > 0);
+	return (ctx->fd > 0);
 }
 
-void sldirwatch_deinit(sldirwatch_t *ctx) {
+SLDIRWATCH_FUNC void sldirwatch_deinit(sldirwatch_t *ctx) {
 	if(ctx->fd <= 0) { return; }
 
 #ifdef __linux__
@@ -135,12 +135,14 @@ void sldirwatch_deinit(sldirwatch_t *ctx) {
 	ctx->fd = 0;
 }
 
-int sldirwatch_add_watchpoint(sldirwatch_t *ctx, const char *path, sldirwatch_callback_f *callback, int data, unsigned int flags) {
+SLDIRWATCH_FUNC int sldirwatch_add_watchpoint(sldirwatch_t *ctx, const char *path,
+		unsigned int flags) {
 	/* pointer to newly placed watchpoint (stored inside context) */
 	sldirwatch_watchpoint_t *watch = &ctx->watchpoints[ctx->num_watchpoints];
+	memset(watch, 0, sizeof(*watch));
 
 	/* check if it's too many watchpoints already */
-	if(ctx->num_watchpoints == ctx->max_watchpoints) { return 0; }
+	if(ctx->num_watchpoints >= ctx->max_watchpoints) { return 0; }
 
 #ifdef __linux__
 	/* add watch to fd - will recieve only 'closed, while was opened for writing' */
@@ -148,7 +150,7 @@ int sldirwatch_add_watchpoint(sldirwatch_t *ctx, const char *path, sldirwatch_ca
 	if(watch->wd < 0) {
 		/* error */
 		watch->wd = 0;
-		return 1;
+		return 0;
 	}
 #elif defined(_WIN32)
 	{
@@ -167,7 +169,7 @@ int sldirwatch_add_watchpoint(sldirwatch_t *ctx, const char *path, sldirwatch_ca
 		watch->ovp.hEvent = CreateEvent(0, FALSE, FALSE, 0);
 		if(!watch->ovp.hEvent) {
 			CloseHandle(watch->dir);
-			return 1;
+			return 0;
 		}
 
 		ReadDirectoryChangesW(watch->dir, watch->lpBuffer, sizeof(watch->lpBuffer), FALSE,
@@ -178,8 +180,6 @@ int sldirwatch_add_watchpoint(sldirwatch_t *ctx, const char *path, sldirwatch_ca
 
 	/* copy watchpoint parameters */
 
-	watch->cb = callback;
-	watch->data = data;
 	watch->flags = flags;
 
 	strncpy(watch->path, path, SLDIRWATCH_PATH_SIZE - 1);
@@ -187,14 +187,35 @@ int sldirwatch_add_watchpoint(sldirwatch_t *ctx, const char *path, sldirwatch_ca
 
 	ctx->num_watchpoints++;
 
-	return 0;
+	return ctx->num_watchpoints;
 }
 
-int sldirwatch_poll_watchpoints(sldirwatch_t *ctx) {
+SLDIRWATCH_FUNC void sldirwatch_set_callback(sldirwatch_t *ctx, int watchpoint_id, sldirwatch_callback_f *callback, void *ud_ptr, int ud_int) {
+	sldirwatch_watchpoint_t *watch = &ctx->watchpoints[watchpoint_id-1];
+	watch->cb = callback;
+	watch->ud_ptr = ud_ptr;
+	watch->ud_int = ud_int;
+}
+
+static void _sldirwatch_add_event(sldirwatch_t *ctx, const sldirwatch_watchpoint_t *watch,
+		const char *rel_filename) {
+	sldirwatch_event_t *ev;
+	if(ctx->num_queued_events >=
+			(int)(sizeof(ctx->queued_events) / sizeof(ctx->queued_events[0]))) {
+		SLDIRWATCH_ASSERT(!"sldirwatch event queue overflow");
+		return;
+	}
+	ev = &ctx->queued_events[ctx->num_queued_events++];
+	ev->watchpoint_id = (watch - ctx->watchpoints) + 1;
+	memcpy(ev->relative_filename, rel_filename, sizeof(ev->relative_filename));
+	_sldirwatch_join_paths(ev->filename, sizeof(ev->filename), watch->path, rel_filename);
+}
+
+static int _sldirwatch_pump_events(sldirwatch_t *ctx) {
 	int ret = 0;	/* return status */
 
 #ifdef __linux__
-	char buf[EVENT_BUF_SIZE];	/* event buffer */
+	char buf[SLDIRWATCH_EVENT_BUF_SIZE];	/* event buffer */
 
 	/* start polling inotify */
 	struct pollfd pfd;
@@ -215,23 +236,12 @@ int sldirwatch_poll_watchpoints(sldirwatch_t *ctx) {
 			struct inotify_event *event = (struct inotify_event*)&buf[i];
 			if(event->len) {
 				/* get watchpoint index by descriptor - need it for callback */
-				int watch_idx = search_wd(ctx, event->wd);
+				int watch_idx = _sldirwatch_search_wd(ctx, event->wd);
 				if(watch_idx != -1) {
 					sldirwatch_watchpoint_t *watch = &ctx->watchpoints[watch_idx];
 
 					if(!(watch->flags & SLDIRWATCH_SKIP_HIDDEN_BIT && event->name[0] == '.')) {
-						if(watch->cb) {
-							char fullpath[SLDIRWATCH_PATH_SIZE];
-							const char *path = event->name;
-
-							if(watch->flags & SLDIRWATCH_MERGE_PATHS_BIT) {
-								join_paths(fullpath, sizeof(fullpath), watch->path, event->name);
-								path = fullpath;
-							}
-
-							/* everything ready - fire callback */
-							watch->cb(path, watch->data);
-						}
+						_sldirwatch_add_event(ctx, watch, event->name);
 						++ret;
 					}
 				} else {
@@ -293,9 +303,11 @@ int sldirwatch_poll_watchpoints(sldirwatch_t *ctx) {
 					WCHAR p[SLDIRWATCH_PATH_SIZE];
 					WCHAR fullp[SLDIRWATCH_PATH_SIZE];
 					HANDLE file;
-					int l = MultiByteToWideChar(CP_UTF8, 0, watch->path, -1, p, sizeof(p) / sizeof(p[0]));
+					int l = MultiByteToWideChar(CP_UTF8, 0, watch->path, -1, p,
+							sizeof(p) / sizeof(p[0]));
 					p[l] = L'\0';
-					join_paths_wchar(fullp, sizeof(fullp) / sizeof(fullp[0]), p, szwFileName);
+					_sldirwatch_join_paths_wchar(fullp, sizeof(fullp) / sizeof(fullp[0]),
+							p, szwFileName);
 
 					file = CreateFileW(fullp, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
 					if(file != INVALID_HANDLE_VALUE) {
@@ -304,12 +316,7 @@ int sldirwatch_poll_watchpoints(sldirwatch_t *ctx) {
 						strcpy(ctx->lastnotify_path, filepath);
 						ctx->lastnotify_callno = ctx->callno;
 
-						if(watch->cb) {
-							char fullpath[SLDIRWATCH_PATH_SIZE];
-							join_paths(fullpath, sizeof(fullpath), watch->path, filepath);
-
-							watch->cb(fullpath, watch->data);
-						}
+						_sldirwatch_add_event(ctx, watch, filepath);
 
 						++ret;
 					}
@@ -327,4 +334,41 @@ int sldirwatch_poll_watchpoints(sldirwatch_t *ctx) {
 #endif
 
 	return ret;
+}
+
+static void _sldirwatch_unqueue_event(sldirwatch_t *ctx, sldirwatch_event_t *ev) {
+	if(ctx->num_queued_events) {
+		const sldirwatch_event_t *iev = &ctx->queued_events[ctx->num_queued_events-1];
+
+		if(ev) {
+			memcpy(ev, iev, sizeof(*ev));
+		}
+
+		if(iev->watchpoint_id && iev->watchpoint_id <= ctx->num_watchpoints) {
+			sldirwatch_watchpoint_t *watch = &ctx->watchpoints[iev->watchpoint_id-1];
+			if(watch->cb) {
+				const char *fn = (watch->flags & SLDIRWATCH_MERGE_PATHS_BIT)
+					? iev->filename
+					: iev->relative_filename;
+				watch->cb(fn, watch->ud_ptr, watch->ud_int);
+			}
+		}
+
+		ctx->num_queued_events--;
+	}
+}
+
+SLDIRWATCH_FUNC int sldirwatch_poll(sldirwatch_t *ctx, sldirwatch_event_t *ev) {
+	/* reporting events in reversed order - is that ok? */
+	if(ctx->num_queued_events) {
+		_sldirwatch_unqueue_event(ctx, ev);
+		return 1;
+	}
+
+	if(_sldirwatch_pump_events(ctx)) {
+		_sldirwatch_unqueue_event(ctx, ev);
+		return 1;
+	}
+
+	return 0;
 }
